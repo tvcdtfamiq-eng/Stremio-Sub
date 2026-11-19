@@ -73,38 +73,59 @@ async function buildTranslatedSrt(type, id) {
   // 3) Traducir con concurrencia limitada
   const out = new Array(cues.length);
   let next = 0;
+  let failed = 0;
   async function worker() {
     while (next < cues.length) {
       const i = next++;
-      out[i] = cues[i].text ? await translate(cues[i].text) : '';
+      if (!cues[i].text) { out[i] = ''; continue; }
+      const tr = await translate(cues[i].text);
+      if (tr === null) { failed++; out[i] = cues[i].text; } else { out[i] = tr; }
     }
   }
-  await Promise.all(Array.from({ length: 8 }, worker));
+  await Promise.all(Array.from({ length: 4 }, worker));
+
+  if (failed > cues.length * 0.2) {
+    throw new Error(`Google no tradujo (${failed}/${cues.length} fallaron). Último error: ${lastError}`);
+  }
 
   // 4) Rearmar SRT
   return cues.map((c, i) => `${i + 1}\n${c.time}\n${out[i]}\n`).join('\n');
 }
 
-// Google Translate (endpoint gratuito no oficial). "es" sin región = español neutro/latino.
+// Google Translate (endpoints gratuitos no oficiales). "es" = español neutro/latino.
+let lastError = '';
 async function translate(text, tries = 3) {
+  const q = encodeURIComponent(text);
+  const urls = [
+    `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=es&dt=t&q=${q}`,
+    `https://translate.google.com/translate_a/single?client=gtx&sl=auto&tl=es&dt=t&q=${q}`,
+    `https://clients5.google.com/translate_a/t?client=dict-chrome-ex&sl=auto&tl=es&q=${q}`
+  ];
   for (let t = 0; t < tries; t++) {
-    try {
-      const res = await fetch(
-        'https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=es&dt=t',
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body: new URLSearchParams({ q: text })
+    for (const url of urls) {
+      try {
+        const res = await fetch(url, {
+          headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36' }
+        });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const json = await res.json();
+        let out;
+        if (Array.isArray(json[0]) && Array.isArray(json[0][0])) {
+          out = json[0].map((x) => x[0]).join('');          // formato gtx
+        } else if (Array.isArray(json[0])) {
+          out = json[0][0];                                   // formato clients5
+        } else {
+          out = json[0];
         }
-      );
-      if (!res.ok) throw new Error('HTTP ' + res.status);
-      const json = await res.json();
-      return latam(json[0].map((s) => s[0]).join(''));
-    } catch (e) {
-      await new Promise((r) => setTimeout(r, 500 * (t + 1)));
+        if (typeof out === 'string' && out.length) return latam(out);
+        throw new Error('respuesta vacía');
+      } catch (e) {
+        lastError = e.message;
+      }
     }
+    await new Promise((r) => setTimeout(r, 700 * (t + 1)));
   }
-  return text; // si falla, deja el original
+  return null; // falló
 }
 
 // Ajustes mínimos a español latino (vosotros -> ustedes)
