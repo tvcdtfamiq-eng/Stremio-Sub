@@ -4,10 +4,11 @@ const express = require('express');
 const PORT = process.env.PORT || 7000;
 const BASE_URL = (process.env.BASE_URL || `http://127.0.0.1:${PORT}`).replace(/\/$/, '');
 const OPENSUBS = 'https://opensubtitles-v3.strem.io/subtitles';
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36';
 
 const manifest = {
   id: 'org.personal.traductor-es-latam',
-  version: '1.0.0',
+  version: '1.0.1',
   name: 'Traductor ES Latam',
   description: 'Traduce al momento los subtítulos al español (Google Translate)',
   resources: ['subtitles'],
@@ -17,9 +18,7 @@ const manifest = {
 };
 
 const builder = new addonBuilder(manifest);
-
-// Cache: id -> Promise<string> (SRT traducido)
-const cache = new Map();
+const cache = new Map(); // "type:id" -> Promise<string>
 
 function getTranslated(type, id) {
   const key = `${type}:${id}`;
@@ -34,7 +33,7 @@ function getTranslated(type, id) {
 }
 
 builder.defineSubtitlesHandler(async ({ type, id }) => {
-  getTranslated(type, id).catch(() => {}); // empieza a traducir ya, en segundo plano
+  getTranslated(type, id).catch(() => {}); // empieza a traducir ya
   return {
     subtitles: [{
       id: 'trad-' + id,
@@ -45,13 +44,18 @@ builder.defineSubtitlesHandler(async ({ type, id }) => {
 });
 
 async function buildTranslatedSrt(type, id) {
-  // 1) Buscar el subtítulo original en inglés
-  const r = await fetch(`${OPENSUBS}/${type}/${encodeURIComponent(id)}.json`);
+  // 0) Probar que Google responde antes de gastar tiempo
+  const probe = await translate('Hello, how are you?', 1);
+  if (probe === null) {
+    throw new Error('Google no responde desde este servidor. Error: ' + lastError);
+  }
+
+  // 1) Subtítulo original en inglés
+  const r = await fetch(`${OPENSUBS}/${type}/${encodeURIComponent(id)}.json`, { signal: AbortSignal.timeout(15000) });
   const data = await r.json();
   const eng = (data.subtitles || []).find((s) => s.lang === 'eng');
   if (!eng) throw new Error('No hay subtítulo en inglés para ' + id);
-
-  const srt = await (await fetch(eng.url)).text();
+  const srt = await (await fetch(eng.url, { signal: AbortSignal.timeout(20000) })).text();
 
   // 2) Parsear SRT
   const cues = srt
@@ -65,36 +69,56 @@ async function buildTranslatedSrt(type, id) {
       if (timeIdx === -1) return null;
       return {
         time: lines[timeIdx],
-        text: lines.slice(timeIdx + 1).join('\n').replace(/<[^>]+>/g, '').trim()
+        text: lines.slice(timeIdx + 1).join(' ').replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim()
       };
     })
     .filter(Boolean);
 
-  // 3) Traducir con concurrencia limitada
-  const out = new Array(cues.length);
-  let next = 0;
+  // 3) Traducir en grupos de 30 líneas
+  const out = new Array(cues.length).fill('');
+  const groups = [];
+  for (let i = 0; i < cues.length; i += 30) groups.push(i);
+  let gi = 0;
   let failed = 0;
+
   async function worker() {
-    while (next < cues.length) {
-      const i = next++;
-      if (!cues[i].text) { out[i] = ''; continue; }
-      const tr = await translate(cues[i].text);
-      if (tr === null) { failed++; out[i] = cues[i].text; } else { out[i] = tr; }
+    while (gi < groups.length) {
+      const start = groups[gi++];
+      const slice = cues.slice(start, start + 30);
+      const texts = slice.map((c) => c.text);
+      let res = await translateBatch(texts);
+      if (!res) {
+        // fallback: una por una
+        res = [];
+        for (const t of texts) {
+          if (!t) { res.push(''); continue; }
+          const tr = await translate(t, 1);
+          if (tr === null) { failed++; res.push(t); } else res.push(tr);
+        }
+      }
+      res.forEach((t, k) => { out[start + k] = t; });
     }
   }
-  await Promise.all(Array.from({ length: 4 }, worker));
+  await Promise.all(Array.from({ length: 3 }, worker));
 
   if (failed > cues.length * 0.2) {
-    throw new Error(`Google no tradujo (${failed}/${cues.length} fallaron). Último error: ${lastError}`);
+    throw new Error(`Google tradujo mal (${failed}/${cues.length} fallaron). Error: ${lastError}`);
   }
 
   // 4) Rearmar SRT
   return cues.map((c, i) => `${i + 1}\n${c.time}\n${out[i]}\n`).join('\n');
 }
 
-// Google Translate (endpoints gratuitos no oficiales). "es" = español neutro/latino.
+// ---------- Google Translate (endpoints gratuitos no oficiales) ----------
 let lastError = '';
-async function translate(text, tries = 3) {
+
+function parseGoogle(json) {
+  if (Array.isArray(json[0]) && Array.isArray(json[0][0])) return json[0].map((x) => x[0]).join(''); // gtx
+  if (Array.isArray(json[0])) return json[0][0];                                                      // clients5
+  return json[0];
+}
+
+async function translate(text, tries = 2) {
   const q = encodeURIComponent(text);
   const urls = [
     `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=es&dt=t&q=${q}`,
@@ -104,38 +128,58 @@ async function translate(text, tries = 3) {
   for (let t = 0; t < tries; t++) {
     for (const url of urls) {
       try {
-        const res = await fetch(url, {
-          headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36' }
-        });
-        if (!res.ok) throw new Error('HTTP ' + res.status);
-        const json = await res.json();
-        let out;
-        if (Array.isArray(json[0]) && Array.isArray(json[0][0])) {
-          out = json[0].map((x) => x[0]).join('');          // formato gtx
-        } else if (Array.isArray(json[0])) {
-          out = json[0][0];                                   // formato clients5
-        } else {
-          out = json[0];
-        }
+        const res = await fetch(url, { headers: { 'User-Agent': UA }, signal: AbortSignal.timeout(6000) });
+        if (!res.ok) throw new Error('HTTP ' + res.status + ' en ' + new URL(url).host);
+        const out = parseGoogle(await res.json());
         if (typeof out === 'string' && out.length) return latam(out);
         throw new Error('respuesta vacía');
       } catch (e) {
         lastError = e.message;
       }
     }
-    await new Promise((r) => setTimeout(r, 700 * (t + 1)));
+    await new Promise((r) => setTimeout(r, 600));
   }
-  return null; // falló
+  return null;
 }
 
-// Ajustes mínimos a español latino (vosotros -> ustedes)
+// Traduce varias líneas en un solo pedido; devuelve null si no se puede separar bien
+async function translateBatch(texts) {
+  if (texts.every((t) => !t)) return texts.map(() => '');
+  try {
+    const res = await fetch('https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=es&dt=t', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': UA },
+      body: new URLSearchParams({ q: texts.join('\n') }),
+      signal: AbortSignal.timeout(15000)
+    });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const full = parseGoogle(await res.json());
+    const parts = full.split('\n');
+    if (parts.length !== texts.length) throw new Error('lote desalineado');
+    return parts.map(latam);
+  } catch (e) {
+    lastError = e.message;
+    return null;
+  }
+}
+
+// Ajustes mínimos a español latino
 function latam(s) {
-  return s
-    .replace(/\bvosotros\b/gi, 'ustedes')
-    .replace(/\bvosotras\b/gi, 'ustedes');
+  return s.replace(/\bvosotros\b/gi, 'ustedes').replace(/\bvosotras\b/gi, 'ustedes');
 }
 
 const app = express();
+
+// Prueba rápida: abrí /test en el navegador
+app.get('/test', async (req, res) => {
+  const t0 = Date.now();
+  const r = await translate('Hello, how are you today?', 1);
+  res.type('text/plain; charset=utf-8').send(
+    r !== null
+      ? `OK (${Date.now() - t0} ms): ${r}`
+      : `FALLÓ (${Date.now() - t0} ms): ${lastError}`
+  );
+});
 
 app.get('/sub/:type/:id.srt', async (req, res) => {
   try {
@@ -143,7 +187,7 @@ app.get('/sub/:type/:id.srt', async (req, res) => {
     res.set('Access-Control-Allow-Origin', '*');
     res.type('text/plain; charset=utf-8').send(srt);
   } catch (e) {
-    res.status(500).send(String(e.message));
+    res.status(500).type('text/plain; charset=utf-8').send(String(e.message));
   }
 });
 
